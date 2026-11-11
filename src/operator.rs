@@ -1,175 +1,128 @@
-use rustc::ty;
-use rustc::mir;
+use std::iter;
 
-use super::*;
+use rand::RngExt;
+use rand::seq::IteratorRandom;
+use rustc_abi::Size;
+use rustc_apfloat::{Float, FloatConvert};
+use rustc_middle::mir;
 
-use helpers::EvalContextExt as HelperEvalContextExt;
+use crate::*;
 
-pub trait EvalContextExt<'tcx> {
-    fn ptr_op(
+impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
+pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
+    fn binary_ptr_op(
         &self,
         bin_op: mir::BinOp,
-        left: PrimVal,
-        left_ty: ty::Ty<'tcx>,
-        right: PrimVal,
-        right_ty: ty::Ty<'tcx>,
-    ) -> EvalResult<'tcx, Option<(PrimVal, bool)>>;
+        left: &ImmTy<'tcx>,
+        right: &ImmTy<'tcx>,
+    ) -> InterpResult<'tcx, ImmTy<'tcx>> {
+        use rustc_middle::mir::BinOp::*;
 
-    fn ptr_int_arithmetic(
-        &self,
-        bin_op: mir::BinOp,
-        left: MemoryPointer,
-        right: i128,
-        signed: bool,
-    ) -> EvalResult<'tcx, (PrimVal, bool)>;
-}
+        let ecx = self.eval_context_ref();
+        trace!("ptr_op: {:?} {:?} {:?}", *left, bin_op, *right);
 
-impl<'a, 'mir, 'tcx> EvalContextExt<'tcx> for EvalContext<'a, 'mir, 'tcx, super::Evaluator<'tcx>> {
-    fn ptr_op(
-        &self,
-        bin_op: mir::BinOp,
-        left: PrimVal,
-        left_ty: ty::Ty<'tcx>,
-        right: PrimVal,
-        right_ty: ty::Ty<'tcx>,
-    ) -> EvalResult<'tcx, Option<(PrimVal, bool)>> {
-        use rustc::mir::interpret::PrimValKind::*;
-        use rustc::mir::BinOp::*;
-        let usize = PrimValKind::from_uint_size(self.memory.pointer_size());
-        let isize = PrimValKind::from_int_size(self.memory.pointer_size());
-        let left_kind = self.ty_to_primval_kind(left_ty)?;
-        let right_kind = self.ty_to_primval_kind(right_ty)?;
-        match bin_op {
-            Offset if left_kind == Ptr && right_kind == usize => {
-                let pointee_ty = left_ty
-                    .builtin_deref(true)
-                    .expect("Offset called on non-ptr type")
-                    .ty;
-                let ptr = self.pointer_offset(
-                    left.into(),
-                    pointee_ty,
-                    right.to_bytes()? as i64,
-                )?;
-                Ok(Some((ptr.into_inner_primval(), false)))
-            }
-            // These work on anything
-            Eq if left_kind == right_kind => {
-                let result = match (left, right) {
-                    (PrimVal::Bytes(left), PrimVal::Bytes(right)) => left == right,
-                    (PrimVal::Ptr(left), PrimVal::Ptr(right)) => left == right,
-                    (PrimVal::Undef, _) |
-                    (_, PrimVal::Undef) => return err!(ReadUndefBytes),
-                    _ => false,
+        interp_ok(match bin_op {
+            Eq | Ne | Lt | Le | Gt | Ge => {
+                assert_eq!(left.layout.backend_repr, right.layout.backend_repr); // types can differ, e.g. fn ptrs with different `for`
+                let size = ecx.pointer_size();
+                // Just compare the bits. ScalarPairs are compared lexicographically.
+                // We thus always compare pairs and simply fill scalars up with 0.
+                let left = match **left {
+                    Immediate::Scalar(l) => (l.to_bits(size)?, 0),
+                    Immediate::ScalarPair(l1, l2) => (l1.to_bits(size)?, l2.to_bits(size)?),
+                    Immediate::Uninit => panic!("we should never see uninit data here"),
                 };
-                Ok(Some((PrimVal::from_bool(result), false)))
-            }
-            Ne if left_kind == right_kind => {
-                let result = match (left, right) {
-                    (PrimVal::Bytes(left), PrimVal::Bytes(right)) => left != right,
-                    (PrimVal::Ptr(left), PrimVal::Ptr(right)) => left != right,
-                    (PrimVal::Undef, _) |
-                    (_, PrimVal::Undef) => return err!(ReadUndefBytes),
-                    _ => true,
+                let right = match **right {
+                    Immediate::Scalar(r) => (r.to_bits(size)?, 0),
+                    Immediate::ScalarPair(r1, r2) => (r1.to_bits(size)?, r2.to_bits(size)?),
+                    Immediate::Uninit => panic!("we should never see uninit data here"),
                 };
-                Ok(Some((PrimVal::from_bool(result), false)))
+                let res = match bin_op {
+                    Eq => left == right,
+                    Ne => left != right,
+                    Lt => left < right,
+                    Le => left <= right,
+                    Gt => left > right,
+                    Ge => left >= right,
+                    _ => bug!(),
+                };
+                ImmTy::from_bool(res, *ecx.tcx)
             }
-            // These need both pointers to be in the same allocation
-            Lt | Le | Gt | Ge | Sub
-                if left_kind == right_kind &&
-                       (left_kind == Ptr || left_kind == usize || left_kind == isize) &&
-                       left.is_ptr() && right.is_ptr() => {
-                let left = left.to_ptr()?;
-                let right = right.to_ptr()?;
-                if left.alloc_id == right.alloc_id {
-                    let res = match bin_op {
-                        Lt => left.offset < right.offset,
-                        Le => left.offset <= right.offset,
-                        Gt => left.offset > right.offset,
-                        Ge => left.offset >= right.offset,
-                        Sub => {
-                            return self.binary_op(
-                                Sub,
-                                PrimVal::Bytes(left.offset as u128),
-                                self.tcx.types.usize,
-                                PrimVal::Bytes(right.offset as u128),
-                                self.tcx.types.usize,
-                            ).map(Some)
-                        }
-                        _ => bug!("We already established it has to be one of these operators."),
-                    };
-                    Ok(Some((PrimVal::from_bool(res), false)))
-                } else {
-                    // Both are pointers, but from different allocations.
-                    err!(InvalidPointerMath)
-                }
+
+            // Some more operations are possible with atomics.
+            // The RHS must be `usize`.
+            Add | Sub | BitOr | BitAnd | BitXor => {
+                assert!(left.layout.ty.is_raw_ptr());
+                assert_eq!(right.layout.ty, ecx.tcx.types.usize);
+                let ptr = left.to_scalar().to_pointer(ecx);
+                // We do the actual operation with usize-typed scalars.
+                let left = ImmTy::from_uint(ptr.addr().bytes(), ecx.machine.layouts.usize);
+                let result = ecx.binary_op(bin_op, &left, right)?;
+                // Construct a new pointer with the provenance of `ptr` (the LHS).
+                let result_ptr = Pointer::new(
+                    ptr.provenance,
+                    Size::from_bytes(result.to_scalar().to_target_usize(ecx)?),
+                );
+
+                ImmTy::from_scalar(Scalar::from_maybe_pointer(result_ptr, ecx), left.layout)
             }
-            // These work if one operand is a pointer, the other an integer
-            Add | BitAnd | Sub
-                if left_kind == right_kind && (left_kind == usize || left_kind == isize) &&
-                       left.is_ptr() && right.is_bytes() => {
-                // Cast to i128 is fine as we checked the kind to be ptr-sized
-                self.ptr_int_arithmetic(
-                    bin_op,
-                    left.to_ptr()?,
-                    right.to_bytes()? as i128,
-                    left_kind == isize,
-                ).map(Some)
-            }
-            Add | BitAnd
-                if left_kind == right_kind && (left_kind == usize || left_kind == isize) &&
-                       left.is_bytes() && right.is_ptr() => {
-                // This is a commutative operation, just swap the operands
-                self.ptr_int_arithmetic(
-                    bin_op,
-                    right.to_ptr()?,
-                    left.to_bytes()? as i128,
-                    left_kind == isize,
-                ).map(Some)
-            }
-            _ => Ok(None),
+
+            _ => span_bug!(ecx.cur_span(), "Invalid operator on pointers: {:?}", bin_op),
+        })
+    }
+
+    fn generate_nan<F1: Float + FloatConvert<F2>, F2: Float>(&self, inputs: &[F1]) -> F2 {
+        let ecx = self.eval_context_ref();
+        if !ecx.machine.float_nondet {
+            return F2::NAN;
+        }
+
+        /// Make the given NaN a signaling NaN.
+        /// Returns `None` if this would not result in a NaN.
+        fn make_signaling<F: Float>(f: F) -> Option<F> {
+            // The quiet/signaling bit is the leftmost bit in the mantissa.
+            // That's position `PRECISION-1`, since `PRECISION` includes the fixed leading 1 bit,
+            // and then we subtract 1 more since this is 0-indexed.
+            let quiet_bit_mask = 1 << (F::PRECISION - 2);
+            // Unset the bit. Double-check that this wasn't the last bit set in the payload.
+            // (which would turn the NaN into an infinity).
+            let f = F::from_bits(f.to_bits() & !quiet_bit_mask);
+            if f.is_nan() { Some(f) } else { None }
+        }
+
+        let mut rand = ecx.machine.rng.borrow_mut();
+        // Assemble an iterator of possible NaNs: preferred, quieting propagation, unchanged propagation.
+        // On some targets there are more possibilities; for now we just generate those options that
+        // are possible everywhere.
+        let preferred_nan = F2::qnan(Some(0));
+        let nans = iter::once(preferred_nan)
+            .chain(inputs.iter().filter(|f| f.is_nan()).map(|&f| {
+                // Regular apfloat cast is quieting.
+                f.convert(&mut false).value
+            }))
+            .chain(inputs.iter().filter(|f| f.is_signaling()).filter_map(|&f| {
+                let f: F2 = f.convert(&mut false).value;
+                // We have to de-quiet this again for unchanged propagation.
+                make_signaling(f)
+            }));
+        // Pick one of the NaNs.
+        let nan = nans.choose(&mut *rand).unwrap();
+        // Non-deterministically flip the sign.
+        if rand.random() {
+            // This will properly flip even for NaN.
+            -nan
+        } else {
+            nan
         }
     }
 
-    fn ptr_int_arithmetic(
-        &self,
-        bin_op: mir::BinOp,
-        left: MemoryPointer,
-        right: i128,
-        signed: bool,
-    ) -> EvalResult<'tcx, (PrimVal, bool)> {
-        use rustc::mir::BinOp::*;
-
-        fn map_to_primval((res, over): (MemoryPointer, bool)) -> (PrimVal, bool) {
-            (PrimVal::Ptr(res), over)
+    fn equal_float_min_max<F: Float>(&self, a: F, b: F) -> F {
+        let ecx = self.eval_context_ref();
+        if !ecx.machine.float_nondet {
+            return a;
         }
-
-        Ok(match bin_op {
-            Sub =>
-                // The only way this can overflow is by underflowing, so signdeness of the right operands does not matter
-                map_to_primval(left.overflowing_signed_offset(-right, self)),
-            Add if signed =>
-                map_to_primval(left.overflowing_signed_offset(right, self)),
-            Add if !signed =>
-                map_to_primval(left.overflowing_offset(right as u64, self)),
-
-            BitAnd if !signed => {
-                let base_mask : u64 = !(self.memory.get(left.alloc_id)?.align.abi() - 1);
-                let right = right as u64;
-                if right & base_mask == base_mask {
-                    // Case 1: The base address bits are all preserved, i.e., right is all-1 there
-                    (PrimVal::Ptr(MemoryPointer::new(left.alloc_id, left.offset & right)), false)
-                } else if right & base_mask == 0 {
-                    // Case 2: The base address bits are all taken away, i.e., right is all-0 there
-                    (PrimVal::from_u128((left.offset & right) as u128), false)
-                } else {
-                    return err!(ReadPointerAsBytes);
-                }
-            }
-
-            _ => {
-                let msg = format!("unimplemented binary op on pointer {:?}: {:?}, {:?} ({})", bin_op, left, right, if signed { "signed" } else { "unsigned" });
-                return err!(Unimplemented(msg));
-            }
-        })
+        // Return one side non-deterministically.
+        let mut rand = ecx.machine.rng.borrow_mut();
+        if rand.random() { a } else { b }
     }
 }

@@ -1,465 +1,218 @@
-#![feature(
-    rustc_private,
-    catch_expr,
-    inclusive_range_fields,
-    inclusive_range_methods,
+#![cfg_attr(all(feature = "native-lib", unix), feature(iter_advance_by))]
+#![cfg_attr(
+    all(
+        feature = "native-lib",
+        target_os = "linux",
+        target_env = "gnu",
+        any(target_arch = "x86", target_arch = "x86_64")
+    ),
+    feature(abort_unwind)
 )]
+#![cfg_attr(windows, feature(windows_by_handle))]
+#![feature(array_try_from_fn)]
+#![feature(clamp_to)]
+#![feature(rustc_private)]
+#![feature(dirfd)]
+#![feature(f16)]
+#![feature(float_gamma)]
+#![feature(float_erf)]
+#![feature(map_try_insert)]
+#![feature(try_blocks)]
+#![feature(integer_casts)]
+#![feature(io_error_more)]
+#![feature(io_error_inprogress)]
+#![feature(io_error_input_output_error)]
+#![feature(io_error_too_many_open_files)]
+#![feature(seek_stream_len)]
+#![feature(variant_count)]
+#![feature(yeet_expr)]
+#![feature(pointer_is_aligned_to)]
+#![feature(unqualified_local_imports)]
+#![feature(derive_coerce_pointee)]
+#![feature(arbitrary_self_types)]
+#![feature(macro_metavar_expr)]
+#![feature(uint_carryless_mul)]
+// Configure clippy and other lints
+#![allow(
+    clippy::collapsible_if,
+    clippy::needless_ifs,
+    clippy::enum_variant_names,
+    clippy::manual_map,
+    clippy::neg_cmp_op_on_partial_ord,
+    clippy::new_without_default,
+    clippy::single_match,
+    clippy::useless_format,
+    clippy::derive_partial_eq_without_eq,
+    clippy::derived_hash_with_manual_eq,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::bool_to_int_with_if,
+    clippy::needless_question_mark,
+    clippy::needless_lifetimes,
+    clippy::too_long_first_doc_paragraph,
+    clippy::len_zero,
+    clippy::while_let_loop,
+    clippy::new_instead_of_clear,
+    // We are not implementing queries here so it's fine
+    rustc::potential_query_instability,
+)]
+#![cfg_attr(not(unix), allow(clippy::permissions_set_readonly_false))]
+#![warn(
+    rust_2018_idioms,
+    unqualified_local_imports,
+    clippy::as_conversions,
+    clippy::manual_let_else
+)]
+// Needed for rustdoc from bootstrap (with `-Znormalize-docs`).
+#![recursion_limit = "256"]
 
-#[macro_use]
-extern crate log;
-
-// From rustc.
-#[macro_use]
-extern crate rustc;
+// The rustc crates we need
+extern crate rustc_abi;
+extern crate rustc_apfloat;
+extern crate rustc_ast;
+extern crate rustc_attr_ir;
+extern crate rustc_codegen_ssa;
+extern crate rustc_const_eval;
 extern crate rustc_data_structures;
-extern crate rustc_mir;
+extern crate rustc_errors;
+extern crate rustc_hir;
+extern crate rustc_hir_analysis;
+extern crate rustc_index;
+extern crate rustc_log;
+extern crate rustc_middle;
+extern crate rustc_session;
+extern crate rustc_span;
+extern crate rustc_structures;
+extern crate rustc_symbol_mangling;
 extern crate rustc_target;
-extern crate syntax;
-extern crate regex;
-#[macro_use]
-extern crate lazy_static;
+// Linking `rustc_driver` pulls in the required  object code as the rest of the rustc crates are
+// shipped only as rmeta files.
+#[allow(unused_extern_crates)]
+extern crate rustc_driver;
 
-use rustc::ty::{self, TyCtxt};
-use rustc::ty::layout::{TyLayout, LayoutOf};
-use rustc::ty::subst::Subst;
-use rustc::hir::def_id::DefId;
-use rustc::mir;
-
-use syntax::ast::Mutability;
-use syntax::codemap::Span;
-
-use std::collections::{HashMap, BTreeMap};
-
-pub use rustc::mir::interpret::*;
-pub use rustc_mir::interpret::*;
-
-mod fn_call;
-mod operator;
-mod intrinsic;
+mod alloc;
+mod alloc_addresses;
+mod borrow_tracker;
+mod clock;
+mod concurrency;
+mod data_structures;
+mod diagnostics;
+mod eval;
 mod helpers;
-mod memory;
-mod tls;
-mod locks;
-mod range_map;
-mod validation;
+mod intrinsics;
+mod machine;
+mod math;
+mod meta_obj;
+mod operator;
+mod provenance_gc;
+mod shims;
+pub mod sym;
 
-use fn_call::EvalContextExt as MissingFnsEvalContextExt;
-use operator::EvalContextExt as OperatorEvalContextExt;
-use intrinsic::EvalContextExt as IntrinsicEvalContextExt;
-use tls::EvalContextExt as TlsEvalContextExt;
-use locks::LockInfo;
-use locks::MemoryExt as LockMemoryExt;
-use validation::EvalContextExt as ValidationEvalContextExt;
-use range_map::RangeMap;
-use validation::{ValidationQuery, AbsPlace};
+// Establish a "crate-wide prelude": we often import `crate::*`.
+// Make all those symbols available in the same place as our own.
+#[doc(no_inline)]
+pub use rustc_const_eval::interpret::*;
+// Resolve ambiguity.
+#[doc(no_inline)]
+pub use rustc_const_eval::interpret::{self, Provenance as _};
+use rustc_data_structures::either::Either;
+use rustc_log::tracing::{self, info, trace, warn};
+use rustc_span::{bug, span_bug};
 
-pub fn eval_main<'a, 'tcx: 'a>(
-    tcx: TyCtxt<'a, 'tcx, 'tcx>,
-    main_id: DefId,
-    start_wrapper: Option<DefId>,
-) {
-    fn run_main<'a, 'mir: 'a, 'tcx: 'mir>(
-        ecx: &mut rustc_mir::interpret::EvalContext<'a, 'mir, 'tcx, Evaluator<'tcx>>,
-        main_id: DefId,
-        start_wrapper: Option<DefId>,
-    ) -> EvalResult<'tcx> {
-        let main_instance = ty::Instance::mono(ecx.tcx.tcx, main_id);
-        let main_mir = ecx.load_mir(main_instance.def)?;
-        let mut cleanup_ptr = None; // Pointer to be deallocated when we are done
-
-        if !main_mir.return_ty().is_nil() || main_mir.arg_count != 0 {
-            return err!(Unimplemented(
-                "miri does not support main functions without `fn()` type signatures"
-                    .to_owned(),
-            ));
-        }
-
-        if let Some(start_id) = start_wrapper {
-            let main_ret_ty = ecx.tcx.fn_sig(main_id).output();
-            let main_ret_ty = main_ret_ty.no_late_bound_regions().unwrap();
-            let start_instance = ty::Instance::resolve(
-                ecx.tcx.tcx,
-                ty::ParamEnv::reveal_all(),
-                start_id,
-                ecx.tcx.mk_substs(
-                    ::std::iter::once(ty::subst::Kind::from(main_ret_ty)))).unwrap();
-            let start_mir = ecx.load_mir(start_instance.def)?;
-
-            if start_mir.arg_count != 3 {
-                return err!(AbiViolation(format!(
-                    "'start' lang item should have three arguments, but has {}",
-                    start_mir.arg_count
-                )));
-            }
-
-            // Return value
-            let size = ecx.tcx.data_layout.pointer_size.bytes();
-            let align = ecx.tcx.data_layout.pointer_align;
-            let ret_ptr = ecx.memory_mut().allocate(size, align, Some(MemoryKind::Stack))?;
-            cleanup_ptr = Some(ret_ptr);
-
-            // Push our stack frame
-            ecx.push_stack_frame(
-                start_instance,
-                start_mir.span,
-                start_mir,
-                Place::from_ptr(ret_ptr, align),
-                StackPopCleanup::None,
-            )?;
-
-            let mut args = ecx.frame().mir.args_iter();
-
-            // First argument: pointer to main()
-            let main_ptr = ecx.memory_mut().create_fn_alloc(main_instance);
-            let dest = ecx.eval_place(&mir::Place::Local(args.next().unwrap()))?;
-            let main_ty = main_instance.ty(ecx.tcx.tcx);
-            let main_ptr_ty = ecx.tcx.mk_fn_ptr(main_ty.fn_sig(ecx.tcx.tcx));
-            ecx.write_value(
-                ValTy {
-                    value: Value::ByVal(PrimVal::Ptr(main_ptr)),
-                    ty: main_ptr_ty,
-                },
-                dest,
-            )?;
-
-            // Second argument (argc): 1
-            let dest = ecx.eval_place(&mir::Place::Local(args.next().unwrap()))?;
-            let ty = ecx.tcx.types.isize;
-            ecx.write_primval(dest, PrimVal::Bytes(1), ty)?;
-
-            // FIXME: extract main source file path
-            // Third argument (argv): &[b"foo"]
-            let dest = ecx.eval_place(&mir::Place::Local(args.next().unwrap()))?;
-            let ty = ecx.tcx.mk_imm_ptr(ecx.tcx.mk_imm_ptr(ecx.tcx.types.u8));
-            let foo = ecx.memory.allocate_cached(b"foo\0");
-            let ptr_size = ecx.memory.pointer_size();
-            let ptr_align = ecx.tcx.data_layout.pointer_align;
-            let foo_ptr = ecx.memory.allocate(ptr_size, ptr_align, None)?;
-            ecx.memory.write_primval(foo_ptr.into(), ptr_align, PrimVal::Ptr(foo.into()), ptr_size, false)?;
-            ecx.memory.mark_static_initialized(foo_ptr.alloc_id, Mutability::Immutable)?;
-            ecx.write_ptr(dest, foo_ptr.into(), ty)?;
-
-            assert!(args.next().is_none(), "start lang item has more arguments than expected");
-        } else {
-            ecx.push_stack_frame(
-                main_instance,
-                main_mir.span,
-                main_mir,
-                Place::from_primval_ptr(PrimVal::Bytes(1).into(), ty::layout::Align::from_bytes(1, 1).unwrap()),
-                StackPopCleanup::None,
-            )?;
-
-            // No arguments
-            let mut args = ecx.frame().mir.args_iter();
-            assert!(args.next().is_none(), "main function must not have arguments");
-        }
-
-        while ecx.step()? {}
-        ecx.run_tls_dtors()?;
-        if let Some(cleanup_ptr) = cleanup_ptr {
-            ecx.memory_mut().deallocate(
-                cleanup_ptr,
-                None,
-                MemoryKind::Stack,
-            )?;
-        }
-        Ok(())
-    }
-
-    let mut ecx = EvalContext::new(tcx.at(syntax::codemap::DUMMY_SP), ty::ParamEnv::reveal_all(), Default::default(), Default::default());
-    match run_main(&mut ecx, main_id, start_wrapper) {
-        Ok(()) => {
-            let leaks = ecx.memory().leak_report();
-            if leaks != 0 {
-                //tcx.sess.err("the evaluated program leaked memory");
-            }
-        }
-        Err(mut e) => {
-            ecx.tcx.sess.err(&e.to_string());
-            ecx.report(&mut e, true, None);
-            for (i, frame) in ecx.stack().iter().enumerate() {
-                trace!("-------------------");
-                trace!("Frame {}", i);
-                trace!("    return: {:#?}", frame.return_place);
-                for (i, local) in frame.locals.iter().enumerate() {
-                    if let Some(local) = local {
-                        trace!("    local {}: {:?}", i, local);
-                    }
-                }
-            }
-        }
-    }
+#[cfg(all(feature = "native-lib", unix))]
+pub mod native_lib {
+    pub use crate::shims::{init_sv, register_retcode_sv};
 }
 
-#[derive(Default)]
-pub struct Evaluator<'tcx> {
-    /// Environment variables set by `setenv`
-    /// Miri does not expose env vars from the host to the emulated program
-    pub(crate) env_vars: HashMap<Vec<u8>, MemoryPointer>,
+// Type aliases that set the provenance parameter.
+pub type Pointer = interpret::Pointer<Option<machine::Provenance>>;
+pub type StrictPointer = interpret::Pointer<machine::Provenance>;
+pub type Scalar = interpret::Scalar<machine::Provenance>;
+pub type ImmTy<'tcx> = interpret::ImmTy<'tcx, machine::Provenance>;
+pub type OpTy<'tcx> = interpret::OpTy<'tcx, machine::Provenance>;
+pub type FnArg<'tcx> = interpret::FnArg<'tcx, machine::Provenance>;
+pub type PlaceTy<'tcx> = interpret::PlaceTy<'tcx, machine::Provenance>;
+pub type MPlaceTy<'tcx> = interpret::MPlaceTy<'tcx, machine::Provenance>;
 
-    /// Places that were suspended by the validation subsystem, and will be recovered later
-    pub(crate) suspended: HashMap<DynamicLifetime, Vec<ValidationQuery<'tcx>>>,
-}
+pub use crate::alloc::MiriAllocBytes;
+pub use crate::alloc_addresses::{EvalContextExt as _, ProvenanceMode};
+pub use crate::borrow_tracker::stacked_borrows::{
+    EvalContextExt as _, Item, Permission, Stack, Stacks,
+};
+pub use crate::borrow_tracker::tree_borrows::{EvalContextExt as _, Tree};
+pub use crate::borrow_tracker::{
+    BorTag, BorrowTrackerMethod, EvalContextExt as _, TreeBorrowsParams,
+};
+pub use crate::clock::{Deadline, Instant, MonotonicClock, TimeoutClock, TimeoutStyle};
+pub use crate::concurrency::blocking_io::{
+    BlockingIoInterest, BlockingIoManager, EvalContextExt as _, SourceFileDescription,
+};
+pub use crate::concurrency::data_race::{
+    AtomicFenceOrd, AtomicReadOrd, AtomicRwOrd, AtomicWriteOrd, EvalContextExt as _,
+};
+pub use crate::concurrency::init_once::{EvalContextExt as _, InitOnceRef};
+pub use crate::concurrency::scheduler::EvalContextExt as _;
+pub use crate::concurrency::sync::{
+    CondvarRef, EvalContextExt as _, MutexRef, RwLockRef, SemaphoreRef,
+};
+pub use crate::concurrency::thread::{
+    BlockReason, DynUnblockCallback, EvalContextExt as _, StackEmptyCallback, ThreadId,
+    ThreadManager, UnblockKind,
+};
+pub use crate::concurrency::{GenmcConfig, GenmcCtx, run_genmc_mode};
+pub use crate::data_structures::dedup_range_map::DedupRangeMap;
+pub use crate::data_structures::mono_hash_map::MonoHashMap;
+pub use crate::diagnostics::{
+    EvalContextExt as _, NonHaltingDiagnostic, TerminationInfo, report_result,
+};
+pub use crate::eval::{MiriConfig, MiriEntryFnType, create_ecx, entry_fn, eval_entry};
+pub use crate::helpers::{EvalContextExt as _, ToU64 as _, ToUsize as _};
+pub use crate::intrinsics::EvalContextExt as _;
+pub use crate::machine::{
+    AlignmentCheck, AllocExtra, BacktraceStyle, DynMachineCallback, FloatRoundingErrorMode,
+    FrameExtra, IsolatedOp, MachineCallback, MemoryKind, MiriInterpCx, MiriInterpCxExt,
+    MiriMachine, MiriMemoryKind, PrimitiveLayouts, Provenance, ProvenanceExtra, RejectOpWith,
+    ValidationMode,
+};
+pub use crate::meta_obj::{EvalContextExt as _, MetaObj};
+pub use crate::operator::EvalContextExt as _;
+pub use crate::provenance_gc::{EvalContextExt as _, LiveAllocs, VisitProvenance, VisitWith};
+pub use crate::shims::EmulateItemResult;
+pub use crate::shims::cpu_affinity::MAX_CPUS;
+pub use crate::shims::env::{EnvVars, EvalContextExt as _};
+pub use crate::shims::foreign_items::{DynSym, EvalContextExt as _};
+pub use crate::shims::io_error::{EvalContextExt as _, IoError, LibcError};
+pub use crate::shims::os_str::EvalContextExt as _;
+pub use crate::shims::panic::EvalContextExt as _;
+pub use crate::shims::readiness::{
+    EvalContextExt as _, Readiness, ReadinessInterest, ReadinessUpdateFlags, ReadinessWatched,
+    ReadinessWatcher,
+};
+pub use crate::shims::sig::EvalContextExt as _;
+pub use crate::shims::time::EvalContextExt as _;
+pub use crate::shims::tls::TlsData;
+pub use crate::shims::unwind::{CatchUnwindData, EvalContextExt as _};
 
-pub type TlsKey = usize;
-
-#[derive(Copy, Clone, Debug)]
-pub struct TlsEntry<'tcx> {
-    data: Pointer, // Will eventually become a map from thread IDs to `Pointer`s, if we ever support more than one thread.
-    dtor: Option<ty::Instance<'tcx>>,
-}
-
-#[derive(Default)]
-pub struct MemoryData<'tcx> {
-    /// The Key to use for the next thread-local allocation.
-    next_thread_local: TlsKey,
-
-    /// pthreads-style thread-local storage.
-    thread_local: BTreeMap<TlsKey, TlsEntry<'tcx>>,
-
-    /// Memory regions that are locked by some function
-    ///
-    /// Only mutable (static mut, heap, stack) allocations have an entry in this map.
-    /// The entry is created when allocating the memory and deleted after deallocation.
-    locks: HashMap<AllocId, RangeMap<LockInfo<'tcx>>>,
-
-    statics: HashMap<GlobalId<'tcx>, AllocId>,
-}
-
-impl<'mir, 'tcx: 'mir> Machine<'mir, 'tcx> for Evaluator<'tcx> {
-    type MemoryData = MemoryData<'tcx>;
-    type MemoryKinds = memory::MemoryKind;
-
-    /// Returns Ok() when the function was handled, fail otherwise
-    fn eval_fn_call<'a>(
-        ecx: &mut EvalContext<'a, 'mir, 'tcx, Self>,
-        instance: ty::Instance<'tcx>,
-        destination: Option<(Place, mir::BasicBlock)>,
-        args: &[ValTy<'tcx>],
-        span: Span,
-        sig: ty::FnSig<'tcx>,
-    ) -> EvalResult<'tcx, bool> {
-        ecx.eval_fn_call(instance, destination, args, span, sig)
-    }
-
-    fn call_intrinsic<'a>(
-        ecx: &mut rustc_mir::interpret::EvalContext<'a, 'mir, 'tcx, Self>,
-        instance: ty::Instance<'tcx>,
-        args: &[ValTy<'tcx>],
-        dest: Place,
-        dest_layout: TyLayout<'tcx>,
-        target: mir::BasicBlock,
-    ) -> EvalResult<'tcx> {
-        ecx.call_intrinsic(instance, args, dest, dest_layout, target)
-    }
-
-    fn try_ptr_op<'a>(
-        ecx: &rustc_mir::interpret::EvalContext<'a, 'mir, 'tcx, Self>,
-        bin_op: mir::BinOp,
-        left: PrimVal,
-        left_ty: ty::Ty<'tcx>,
-        right: PrimVal,
-        right_ty: ty::Ty<'tcx>,
-    ) -> EvalResult<'tcx, Option<(PrimVal, bool)>> {
-        ecx.ptr_op(bin_op, left, left_ty, right, right_ty)
-    }
-
-    fn mark_static_initialized<'a>(
-        mem: &mut Memory<'a, 'mir, 'tcx, Self>,
-        id: AllocId,
-        _mutability: Mutability,
-    ) -> EvalResult<'tcx, bool> {
-        use memory::MemoryKind::*;
-        match mem.get_alloc_kind(id) {
-            // FIXME: This could be allowed, but not for env vars set during miri execution
-            Some(MemoryKind::Machine(Env)) => err!(Unimplemented("statics can't refer to env vars".to_owned())),
-            _ => Ok(false), // TODO: What does the bool mean?
-        }
-    }
-
-    fn init_static<'a>(
-        ecx: &mut EvalContext<'a, 'mir, 'tcx, Self>,
-        cid: GlobalId<'tcx>,
-    ) -> EvalResult<'tcx, AllocId> {
-        // Step 1: If the static has already been evaluated return the cached version
-        if let Some(alloc_id) = ecx.memory.data.statics.get(&cid) {
-            return Ok(*alloc_id);
-        }
-
-        let tcx = ecx.tcx.tcx;
-
-        // Step 2: Load mir
-        let mut mir = ecx.load_mir(cid.instance.def)?;
-        if let Some(index) = cid.promoted {
-            mir = &mir.promoted[index];
-        }
-        assert!(mir.arg_count == 0);
-
-        // Step 3: Allocate storage
-        let layout = ecx.layout_of(mir.return_ty().subst(tcx, cid.instance.substs))?;
-        assert!(!layout.is_unsized());
-        let ptr = ecx.memory.allocate(
-            layout.size.bytes(),
-            layout.align,
-            None,
-        )?;
-
-        // Step 4: Cache allocation id for recursive statics
-        assert!(ecx.memory.data.statics.insert(cid, ptr.alloc_id).is_none());
-
-        // Step 5: Push stackframe to evaluate static
-        let cleanup = StackPopCleanup::None;
-        ecx.push_stack_frame(
-            cid.instance,
-            mir.span,
-            mir,
-            Place::from_ptr(ptr, layout.align),
-            cleanup,
-        )?;
-
-        // Step 6: Step until static has been initialized
-        let call_stackframe = ecx.stack().len();
-        while ecx.step()? && ecx.stack().len() >= call_stackframe {
-            if ecx.stack().len() == call_stackframe {
-                let frame = ecx.frame_mut();
-                let bb = &frame.mir.basic_blocks()[frame.block];
-                if bb.statements.len() == frame.stmt && !bb.is_cleanup {
-                    match bb.terminator().kind {
-                        ::rustc::mir::TerminatorKind::Return => {
-                            for (local, _local_decl) in mir.local_decls.iter_enumerated().skip(1) {
-                                // Don't deallocate locals, because the return value might reference them
-                                frame.storage_dead(local);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        // TODO: Freeze immutable statics without copying them to the global static cache
-
-        // Step 7: Return the alloc
-        Ok(ptr.alloc_id)
-    }
-
-    fn box_alloc<'a>(
-        ecx: &mut EvalContext<'a, 'mir, 'tcx, Self>,
-        ty: ty::Ty<'tcx>,
-        dest: Place,
-    ) -> EvalResult<'tcx> {
-        let layout = ecx.layout_of(ty)?;
-
-        // Call the `exchange_malloc` lang item
-        let malloc = ecx.tcx.lang_items().exchange_malloc_fn().unwrap();
-        let malloc = ty::Instance::mono(ecx.tcx.tcx, malloc);
-        let malloc_mir = ecx.load_mir(malloc.def)?;
-        ecx.push_stack_frame(
-            malloc,
-            malloc_mir.span,
-            malloc_mir,
-            dest,
-            // Don't do anything when we are done.  The statement() function will increment
-            // the old stack frame's stmt counter to the next statement, which means that when
-            // exchange_malloc returns, we go on evaluating exactly where we want to be.
-            StackPopCleanup::None,
-        )?;
-
-        let mut args = ecx.frame().mir.args_iter();
-        let usize = ecx.tcx.types.usize;
-
-        // First argument: size
-        let dest = ecx.eval_place(&mir::Place::Local(args.next().unwrap()))?;
-        ecx.write_value(
-            ValTy {
-                value: Value::ByVal(PrimVal::Bytes(match layout.size.bytes() {
-                    0 => 1,
-                    size => size,
-                }.into())),
-                ty: usize,
-            },
-            dest,
-        )?;
-
-        // Second argument: align
-        let dest = ecx.eval_place(&mir::Place::Local(args.next().unwrap()))?;
-        ecx.write_value(
-            ValTy {
-                value: Value::ByVal(PrimVal::Bytes(layout.align.abi().into())),
-                ty: usize,
-            },
-            dest,
-        )?;
-
-        // No more arguments
-        assert!(args.next().is_none(), "exchange_malloc lang item has more arguments than expected");
-        Ok(())
-    }
-
-    fn global_item_with_linkage<'a>(
-        _ecx: &mut EvalContext<'a, 'mir, 'tcx, Self>,
-        _instance: ty::Instance<'tcx>,
-        _mutability: Mutability,
-    ) -> EvalResult<'tcx> {
-        panic!("remove this function from rustc");
-    }
-
-    fn check_locks<'a>(
-        mem: &Memory<'a, 'mir, 'tcx, Self>,
-        ptr: MemoryPointer,
-        size: u64,
-        access: AccessKind,
-    ) -> EvalResult<'tcx> {
-        mem.check_locks(ptr, size, access)
-    }
-
-    fn add_lock<'a>(
-        mem: &mut Memory<'a, 'mir, 'tcx, Self>,
-        id: AllocId,
-    ) {
-        mem.data.locks.insert(id, RangeMap::new());
-    }
-
-    fn free_lock<'a>(
-        mem: &mut Memory<'a, 'mir, 'tcx, Self>,
-        id: AllocId,
-        len: u64,
-    ) -> EvalResult<'tcx> {
-        mem.data.locks
-            .remove(&id)
-            .expect("allocation has no corresponding locks")
-            .check(
-                Some(mem.cur_frame),
-                0,
-                len,
-                AccessKind::Read,
-            )
-            .map_err(|lock| {
-                EvalErrorKind::DeallocatedLockedMemory {
-                    //ptr, FIXME
-                    ptr: MemoryPointer {
-                        alloc_id: AllocId(0),
-                        offset: 0,
-                    },
-                    lock: lock.active,
-                }.into()
-            })
-    }
-
-    fn end_region<'a>(
-        ecx: &mut EvalContext<'a, 'mir, 'tcx, Self>,
-        reg: Option<::rustc::middle::region::Scope>,
-    ) -> EvalResult<'tcx> {
-        ecx.end_region(reg)
-    }
-
-    fn validation_op<'a>(
-        _ecx: &mut EvalContext<'a, 'mir, 'tcx, Self>,
-        _op: ::rustc::mir::ValidationOp,
-        _operand: &::rustc::mir::ValidationOperand<'tcx, ::rustc::mir::Place<'tcx>>,
-    ) -> EvalResult<'tcx> {
-        // FIXME: prevent this from ICEing
-        //ecx.validation_op(op, operand)
-        Ok(())
-    }
-}
+/// Insert rustc arguments at the beginning of the argument list that Miri wants to be
+/// set per default, for maximal validation power.
+/// Also disable the MIR pass that inserts an alignment check on every pointer dereference. Miri
+/// does that too, and with a better error message.
+pub const MIRI_DEFAULT_ARGS: &[&str] = &[
+    "--cfg=miri",
+    "-Zalways-encode-mir",
+    "-Zextra-const-ub-checks",
+    "-Zmir-preserve-ub",
+    "-Zmir-opt-level=0",
+    // Disable passes that add checks for language UB -- we get better diagnostics if
+    // we let Miri do these checks.
+    "-Zmir-enable-passes=-CheckAlignment,-CheckNull,-CheckEnums",
+    // FIXME: Disable some passes to make higher opt levels also work.
+    // - ReferencePropagation is incompatible with SB's ref-to-raw cast behavior.
+    //   The fix here is to ditch SB and use TB instead but we're not yet ready for that.
+    // - GVN is not yet adjusted for implicit retags during assignments.
+    //   <https://github.com/rust-lang/rust/issues/165327>
+    "-Zmir-enable-passes=-ReferencePropagation,-GVN",
+    // Deduplicating diagnostics means we miss events when tracking what happens during an
+    // execution. Let's not do that.
+    "-Zdeduplicate-diagnostics=no",
+];
